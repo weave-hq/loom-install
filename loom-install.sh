@@ -75,6 +75,18 @@ configure_kubeconfig() {
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
   echo "Waiting for Kubernetes node"
+  local max_attempts=30
+  local attempt=0
+  while ! kubectl cluster-info >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [[ $attempt -ge $max_attempts ]]; then
+      echo "k3s API server failed to become ready after ${max_attempts} attempts"
+      exit 1
+    fi
+    echo "  Attempt $attempt/$max_attempts..."
+    sleep 2
+  done
+
   kubectl wait --for=condition=Ready node --all --timeout=180s
 }
 
