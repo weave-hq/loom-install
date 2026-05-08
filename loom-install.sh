@@ -6,6 +6,7 @@ RELEASE_NAME="loom"
 NAMESPACE="loom"
 VERSION=""
 COMMAND="${1:-}"
+GHCR_PULL_SECRET="loom-ghcr-pull"
 
 usage() {
   cat <<EOF
@@ -19,6 +20,7 @@ Options:
   --version <version>      Loom version, e.g. 0.1.0
   --namespace <namespace>  Kubernetes namespace, default: loom
   --github-token <token>   Token for private release assets
+  --ghcr-pull-secret <name> Image pull secret name, default: loom-ghcr-pull
   --purge-data             Delete PVCs/secrets/namespace during wipe
 EOF
 }
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       GITHUB_TOKEN="$2"
       shift 2
       ;;
+    --ghcr-pull-secret)
+      GHCR_PULL_SECRET="$2"
+      shift 2
+      ;;
     --purge-data)
       PURGE_DATA="true"
       shift
@@ -57,6 +63,13 @@ done
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "Please run as root or with sudo"
+    exit 1
+  fi
+}
+
+require_github_token() {
+  if [[ -z "$GITHUB_TOKEN" ]]; then
+    echo "--github-token (or GITHUB_TOKEN env var) is required for private releases and GHCR pulls"
     exit 1
   fi
 }
@@ -149,6 +162,39 @@ generate_secret_value() {
   openssl rand -base64 32 | tr -d '\n'
 }
 
+create_ghcr_pull_secret() {
+  local github_user=""
+  local user_api="https://api.github.com/user"
+
+  if command -v jq >/dev/null 2>&1; then
+    github_user="$(curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "$user_api" | jq -r '.login')"
+  elif command -v python3 >/dev/null 2>&1; then
+    github_user="$(curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "$user_api" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("login", ""))')"
+  else
+    echo "Neither jq nor python3 is available to resolve GitHub username" >&2
+    return 1
+  fi
+
+  if [[ -z "$github_user" || "$github_user" == "null" ]]; then
+    echo "Failed to resolve GitHub username from token" >&2
+    return 1
+  fi
+
+  echo "Creating/updating GHCR image pull secret: ${GHCR_PULL_SECRET}"
+  kubectl -n "$NAMESPACE" create secret docker-registry "$GHCR_PULL_SECRET" \
+    --docker-server=ghcr.io \
+    --docker-username="$github_user" \
+    --docker-password="$GITHUB_TOKEN" \
+    --docker-email="none@example.com" \
+    --dry-run=client -o yaml | kubectl apply -f -
+}
+
 create_platform_secrets() {
   echo "Creating namespace and secrets"
 
@@ -194,6 +240,8 @@ create_platform_secrets() {
       --from-literal=REDIS_URL="redis://:${redis_password}@redis-master:6379" \
       --from-literal=LOOM_SESSION_REDIS_URL="redis://:${redis_password}@redis-master:6379/0"
   fi
+
+  create_ghcr_pull_secret
 }
 
 install_or_upgrade_loom() {
@@ -201,6 +249,8 @@ install_or_upgrade_loom() {
     echo "--version is required"
     exit 1
   fi
+
+  require_github_token
 
   local tmp_dir
   tmp_dir="$(mktemp -d)" || {
@@ -232,6 +282,7 @@ install_or_upgrade_loom() {
     --namespace "$NAMESPACE" \
     --create-namespace \
     -f "$values_file" \
+    --set imagePullSecrets[0].name="$GHCR_PULL_SECRET" \
     --set secrets.create=false \
     --set secrets.existingSecret=loom-platform-secrets \
     --set postgresql.auth.existingSecret=loom-postgres-secret \
