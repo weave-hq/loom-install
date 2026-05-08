@@ -114,28 +114,44 @@ create_platform_secrets() {
   kubectl create namespace "$NAMESPACE" \
     --dry-run=client -o yaml | kubectl apply -f -
 
-  if kubectl -n "$NAMESPACE" get secret loom-platform-secrets >/dev/null 2>&1; then
-    echo "loom-platform-secrets already exists"
-  else
-    kubectl -n "$NAMESPACE" create secret generic loom-platform-secrets \
-      --from-literal=SESSION_SECRET="$(generate_secret_value)" \
-      --from-literal=JWT_SECRET="$(generate_secret_value)" \
-      --from-literal=ENCRYPTION_KEY="$(generate_secret_value)"
-  fi
+  # Generate passwords once so they're consistent across all secrets
+  local pg_password redis_password
+  pg_password="$(generate_secret_value)"
+  redis_password="$(generate_secret_value)"
 
+  # Create or skip postgres secret
   if kubectl -n "$NAMESPACE" get secret loom-postgres-secret >/dev/null 2>&1; then
     echo "loom-postgres-secret already exists"
   else
+    echo "Creating loom-postgres-secret"
     kubectl -n "$NAMESPACE" create secret generic loom-postgres-secret \
-      --from-literal=postgres-password="$(generate_secret_value)" \
-      --from-literal=password="$(generate_secret_value)"
+      --from-literal=postgres-password="$pg_password" \
+      --from-literal=password="$pg_password"
   fi
 
+  # Create or skip redis secret
   if kubectl -n "$NAMESPACE" get secret loom-redis-secret >/dev/null 2>&1; then
     echo "loom-redis-secret already exists"
   else
+    echo "Creating loom-redis-secret"
     kubectl -n "$NAMESPACE" create secret generic loom-redis-secret \
-      --from-literal=redis-password="$(generate_secret_value)"
+      --from-literal=redis-password="$redis_password"
+  fi
+
+  # Create or skip platform secret
+  # This secret contains all credentials needed by services: SESSION_SECRET,
+  # CONTROL_PLANE_INTERNAL_KEY, DATABASE_URL (with coordinated pg_password),
+  # REDIS_URL and LOOM_SESSION_REDIS_URL (with coordinated redis_password).
+  if kubectl -n "$NAMESPACE" get secret loom-platform-secrets >/dev/null 2>&1; then
+    echo "loom-platform-secrets already exists"
+  else
+    echo "Creating loom-platform-secrets"
+    kubectl -n "$NAMESPACE" create secret generic loom-platform-secrets \
+      --from-literal=SESSION_SECRET="$(generate_secret_value)" \
+      --from-literal=CONTROL_PLANE_INTERNAL_KEY="$(generate_secret_value)" \
+      --from-literal=DATABASE_URL="postgresql://loomai:${pg_password}@postgres:5432/loomai" \
+      --from-literal=REDIS_URL="redis://:${redis_password}@redis-master:6379" \
+      --from-literal=LOOM_SESSION_REDIS_URL="redis://:${redis_password}@redis-master:6379/0"
   fi
 }
 
@@ -164,9 +180,12 @@ install_or_upgrade_loom() {
     --namespace "$NAMESPACE" \
     --create-namespace \
     -f "$values_file" \
+    --set secrets.create=false \
     --set secrets.existingSecret=loom-platform-secrets \
     --set postgresql.auth.existingSecret=loom-postgres-secret \
+    --set redis.auth.enabled=true \
     --set redis.auth.existingSecret=loom-redis-secret \
+    --set redis.auth.existingSecretPasswordKey=redis-password \
     --wait \
     --timeout 10m
 }
