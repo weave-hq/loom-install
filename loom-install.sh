@@ -74,7 +74,8 @@ install_k3s() {
 configure_kubeconfig() {
   export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-  echo "Waiting for Kubernetes node"
+  # Wait for k3s API server to be responsive
+  echo "Waiting for k3s API server to be ready"
   local max_attempts=30
   local attempt=0
   while ! kubectl cluster-info >/dev/null 2>&1; do
@@ -87,6 +88,7 @@ configure_kubeconfig() {
     sleep 2
   done
 
+  echo "Waiting for Kubernetes node to be ready"
   kubectl wait --for=condition=Ready node --all --timeout=180s
 }
 
@@ -104,11 +106,38 @@ download_asset() {
   local url="$1"
   local output="$2"
 
+  # For private repos, direct /releases/download/ URLs return 404 even with a token.
+  # Resolve the asset via the GitHub API which redirects to a presigned download URL.
   if [[ -n "$GITHUB_TOKEN" ]]; then
+    local tag filename api_url release_json asset_id
+    tag="$(echo "$url" | sed 's|.*/download/\([^/]*\)/.*|\1|')"
+    filename="$(basename "$url")"
+    api_url="https://api.github.com/repos/${REPO}/releases/tags/${tag}"
+
+    release_json="$(curl -fsSL \
+      -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "$api_url")"
+
+    if command -v jq >/dev/null 2>&1; then
+      asset_id="$(echo "$release_json" | jq -r --arg name "$filename" '.assets[] | select(.name == $name) | .id' | head -1)"
+    elif command -v python3 >/dev/null 2>&1; then
+      asset_id="$(echo "$release_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); name=sys.argv[1]; ids=[str(a.get("id")) for a in data.get("assets",[]) if a.get("name")==name]; print(ids[0] if ids else "")' "$filename")"
+    else
+      echo "Neither jq nor python3 is available to parse release assets" >&2
+      return 1
+    fi
+
+    if [[ -z "$asset_id" || "$asset_id" == "null" ]]; then
+      echo "Asset not found: ${filename} in release ${tag}" >&2
+      return 1
+    fi
+
     curl -fL \
       -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+      -H "Accept: application/octet-stream" \
       -o "$output" \
-      "$url"
+      "https://api.github.com/repos/${REPO}/releases/assets/${asset_id}"
   else
     curl -fL \
       -o "$output" \
@@ -174,7 +203,10 @@ install_or_upgrade_loom() {
   fi
 
   local tmp_dir
-  tmp_dir="$(mktemp -d)"
+  tmp_dir="$(mktemp -d)" || {
+    echo "Failed to create temporary directory"
+    exit 1
+  }
   trap 'rm -rf "$tmp_dir"' EXIT
 
   local base_url="https://github.com/${REPO}/releases/download/v${VERSION}"
@@ -183,8 +215,16 @@ install_or_upgrade_loom() {
 
   echo "Downloading Loom release v${VERSION}"
 
-  download_asset "${base_url}/loom-${VERSION}.tgz" "$chart_file"
-  download_asset "${base_url}/values-v${VERSION}.yaml" "$values_file"
+  download_asset "${base_url}/loom-${VERSION}.tgz" "$chart_file" || {
+    echo "Failed to download chart from: ${base_url}/loom-${VERSION}.tgz"
+    echo "Ensure the release v${VERSION} has been published on GitHub"
+    exit 1
+  }
+
+  download_asset "${base_url}/values-v${VERSION}.yaml" "$values_file" || {
+    echo "Failed to download values from: ${base_url}/values-v${VERSION}.yaml"
+    exit 1
+  }
 
   echo "Installing/upgrading Loom v${VERSION}"
 
@@ -261,3 +301,4 @@ case "$COMMAND" in
     exit 1
     ;;
 esac
+
