@@ -5,7 +5,6 @@ REPO="weave-hq/loom-install"
 BIN_NAME="loom"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-latest}"
-LIB_DIR="${LIB_DIR:-/usr/local/lib/${BIN_NAME}}"
 
 detect_os() {
   case "$(uname -s)" in
@@ -58,15 +57,6 @@ resolve_release_tag() {
   echo "cli-v${VERSION}"
 }
 
-resolve_semver_from_tag() {
-  local tag="$1"
-  case "$tag" in
-    cli-v*) echo "${tag#cli-v}" ;;
-    v*) echo "${tag#v}" ;;
-    *) echo "$tag" ;;
-  esac
-}
-
 install_file() {
   local source="$1"
   local destination="$2"
@@ -90,10 +80,9 @@ ensure_dir() {
 }
 
 RELEASE_TAG="$(resolve_release_tag)"
-SEMVER="$(resolve_semver_from_tag "$RELEASE_TAG")"
 
 BINARY_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${BIN_NAME}-${OS}-${ARCH}"
-TARBALL_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/loom-cli-${SEMVER}.tar.gz"
+TARBALL_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/loom-cli-${OS}-${ARCH}.tar.gz"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -116,46 +105,24 @@ if ! download_url_exists "$TARBALL_URL"; then
   echo "No supported release asset found for ${RELEASE_TAG}." >&2
   echo "Checked: ${BINARY_URL}" >&2
   echo "Checked: ${TARBALL_URL}" >&2
-  exit 1
-fi
-
-if ! command -v node >/dev/null 2>&1; then
-  echo "node is required to install CLI tarball releases" >&2
+  echo "Supported native targets: darwin-amd64, darwin-arm64, linux-amd64, linux-arm64" >&2
   exit 1
 fi
 
 curl -fsSL "$TARBALL_URL" -o "$TMP/loom-cli.tar.gz"
-tar -xzf "$TMP/loom-cli.tar.gz" -C "$TMP"
 
-PKG_DIR="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d -name "loom-cli-*" | head -n 1)"
-if [ -z "$PKG_DIR" ] || [ ! -f "$PKG_DIR/dist/main.js" ]; then
-  echo "Invalid CLI tarball format from ${TARBALL_URL}" >&2
+TARBALL_EXTRACT_DIR="$TMP/extracted"
+mkdir -p "$TARBALL_EXTRACT_DIR"
+tar -xzf "$TMP/loom-cli.tar.gz" -C "$TARBALL_EXTRACT_DIR"
+
+if [ ! -f "$TARBALL_EXTRACT_DIR/$BIN_NAME" ]; then
+  echo "Invalid CLI tarball format from ${TARBALL_URL}: missing ${BIN_NAME}" >&2
   exit 1
 fi
 
-TARGET_DIR="${LIB_DIR}/${SEMVER}"
-ensure_dir "$(dirname "$TARGET_DIR")"
-if [ -w "$(dirname "$TARGET_DIR")" ]; then
-  rm -rf "$TARGET_DIR"
-  cp -R "$PKG_DIR" "$TARGET_DIR"
-else
-  sudo rm -rf "$TARGET_DIR"
-  sudo cp -R "$PKG_DIR" "$TARGET_DIR"
-fi
+chmod +x "$TARBALL_EXTRACT_DIR/$BIN_NAME"
+install_file "$TARBALL_EXTRACT_DIR/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
 
-cat > "$TMP/$BIN_NAME" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-exec node "${TARGET_DIR}/dist/main.js" "\$@"
-EOF
-chmod +x "$TMP/$BIN_NAME"
-install_file "$TMP/$BIN_NAME" "$INSTALL_DIR/$BIN_NAME"
-
-echo "Installed tarball from ${TARBALL_URL}"
-echo "Installed launcher: ${INSTALL_DIR}/${BIN_NAME}"
-echo "Package location: ${TARGET_DIR}"
-echo "Installed package version: ${SEMVER}"
-
-if ! "${INSTALL_DIR}/${BIN_NAME}" --version >/dev/null 2>&1; then
-  echo "Warning: installed tarball is not currently self-contained and may require additional runtime dependencies in the release artifact." >&2
-fi
+echo "Installed binary from ${TARBALL_URL}"
+echo "Installed:"
+"$INSTALL_DIR/$BIN_NAME" --version || true
